@@ -1,9 +1,16 @@
 """
 ╔════════════════════════════════════════════════════════════════════╗
-║      TRADETERMINAL — SMC CONFLUENCE ENGINE v15.1 PRODUCTION      ║
-║      1% Risk | Strategy SL | Validated | 24/7 Ready              ║
+║      TRADETERMINAL — SMC CONFLUENCE ENGINE v16.0                 ║
+║      1% Risk | Auto-Scanner 24/7 | Daily Alive Ping              ║
 ║      Twelve Data XAUUSD Spot — India Friendly                    ║
 ╚════════════════════════════════════════════════════════════════════╝
+
+FEATURES:
+- 1% risk per trade with strategy-based SL
+- Auto-scanner runs every 5 minutes (no manual click needed)
+- Daily "I'm alive" ping at 9:00 AM IST (3:30 AM UTC)
+- Telegram alerts for setups + daily status
+- 24/7 operation on Render
 """
 
 from fastapi import FastAPI, HTTPException
@@ -16,6 +23,8 @@ from datetime import datetime, timedelta, timezone
 import warnings
 import requests
 import os
+import threading
+import time as time_module
 
 warnings.filterwarnings("ignore")
 
@@ -23,7 +32,7 @@ warnings.filterwarnings("ignore")
 # APP
 # ============================================================
 
-app = FastAPI(title="TradeTerminal SMC Confluence v15.1", version="15.1")
+app = FastAPI(title="TradeTerminal SMC Confluence v16.0", version="16.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ============================================================
@@ -132,7 +141,7 @@ def fetch_twelve(symbol, interval, start, end):
             
             r = requests.get("https://api.twelvedata.com/time_series", params=params, timeout=30)
             if r.status_code == 429:
-                import time; time.sleep(60); continue
+                time_module.sleep(60); continue
             if r.status_code != 200: break
             data = r.json()
             if "values" not in data: break
@@ -148,10 +157,9 @@ def fetch_twelve(symbol, interval, start, end):
         df = df.sort_values("date").drop_duplicates("date").dropna(subset=["date"]).reset_index(drop=True)
         df["session"] = df["date"].apply(get_session)
         df = add_indicators(df)
-        print(f"   ✅ {len(df)} rows | LON={len(df[df['session']=='London'])} NY={len(df[df['session']=='New York'])}")
         return df
     except Exception as e:
-        print(f"⚠️ {e}")
+        print(f"⚠️ Twelve Data: {e}")
         return None
 
 def fetch_data(pair, tf, start, end):
@@ -362,9 +370,7 @@ def run_backtest(df_s, df_e, df_h, rules, capital):
     pf = round(gp / gl, 2) if gl > 0 else (999 if gp > 0 else 0)
     net = capital - initial
     
-    print(f"\n{'='*60}")
-    print(f"📊 v15.1 | {total} trades | {len(wins)}W/{len(losses)}L/{len(tos)}TO")
-    print(f"   WR: {wr}% | PF: {pf} | P&L: ${net:,.2f} | Return: {net/initial*100:.1f}%")
+    print(f"📊 {total} trades | {len(wins)}W/{len(losses)}L | WR:{wr}% | P&L:${net:,.2f}")
     
     eq = [{"time":0,"value":round(initial,2)}]
     r = initial
@@ -384,17 +390,100 @@ def run_backtest(df_s, df_e, df_h, rules, capital):
 
 def send_tg(msg):
     try:
-        import requests as rq
-        rq.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"HTML"},timeout=5)
-    except: pass
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                     json={"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"HTML"},timeout=5)
+    except Exception as e:
+        print(f"TG error: {e}")
+
+# ============================================================
+# 24/7 AUTO SCANNER
+# ============================================================
+
+def run_scanner():
+    """Scan for SMC setups and send Telegram alerts"""
+    try:
+        end = utc_now()
+        start = end - timedelta(days=5)
+        
+        df_s = fetch_data("XAUUSD", "15m", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        
+        if df_s is None or len(df_s) < 30:
+            print("⚠️ Scanner: Insufficient data")
+            return False
+        
+        df_h = fetch_data("XAUUSD", "4h", (end - timedelta(days=30)).strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        
+        for i in range(len(df_s) - 1, max(29, len(df_s) - 6), -1):
+            bias = get_htf_bias(df_h, df_s.iloc[i]["date"], fb=df_s.iloc[i])
+            setup = build_setup(df_s, i, {}, bias)
+            
+            if setup:
+                lots = calculate_position_size(5000, setup["entry"], setup["sl"])
+                emoji = "🟢 LONG" if setup["direction"] == "BUY" else "🔴 SHORT"
+                msg = f"""🤖 <b>SMC CONFLUENCE — {emoji}</b>
+<b>XAUUSD</b>
+━━━━━━━━━━━━━━━━━━━━━
+📍 <b>Entry:</b> ${setup['entry']}
+🛑 <b>SL:</b> ${setup['sl']} ({setup['risk_points']} pts)
+🎯 <b>TP:</b> ${setup['tp']}
+📊 <b>R:R 1:{setup['rr_ratio']}</b>
+📐 <b>Lots:</b> {lots}
+💰 <b>Risk:</b> ${round(lots*setup['risk_points']*POINT_VALUE,2)} (1%)
+<b>{' | '.join(setup['met_rules'])}</b>
+━━━━━━━━━━━━━━━━━━━━━
+⏰ {setup['setup_time']}
+🧠 v16.0 Auto"""
+                send_tg(msg)
+                print(f"🚨 SIGNAL SENT: {setup['direction']} @ ${setup['entry']}")
+                return True
+        
+        print(f"✅ Scan OK — No setup at {end.strftime('%H:%M UTC')}")
+        return False
+        
+    except Exception as e:
+        print(f"⚠️ Scanner error: {e}")
+        return False
+
+def auto_scanner_loop():
+    """Background loop: scan every 5 minutes"""
+    print("🔍 Auto-Scanner: Starting (every 5 min)...")
+    time_module.sleep(10)  # Initial delay for server startup
+    
+    while True:
+        run_scanner()
+        time_module.sleep(300)  # 5 minutes
+
+def daily_alive_ping():
+    """Send 'I'm alive' message every day at 9:00 AM IST (3:30 AM UTC)"""
+    print("💓 Daily Ping: Scheduled for 3:30 UTC (9:00 AM IST)")
+    
+    while True:
+        now = utc_now()
+        
+        # Check if it's 3:30 UTC
+        if now.hour == 3 and now.minute == 30:
+            msg = f"""💓 <b>SMC Engine — Daily Status</b>
+━━━━━━━━━━━━━━━━━━━━━
+✅ <b>Status:</b> ONLINE
+🕐 <b>Time:</b> {now.strftime('%Y-%m-%d %H:%M UTC')} (9:00 AM IST)
+🔍 <b>Scanner:</b> Running (every 5 min)
+📡 <b>Data:</b> Twelve Data XAUUSD
+💰 <b>Risk:</b> 1% per trade
+━━━━━━━━━━━━━━━━━━━━━
+🧠 v16.0 — All Systems Go!"""
+            send_tg(msg)
+            print("💓 Daily ping sent!")
+            time_module.sleep(120)  # Sleep 2 min to avoid duplicate
+        
+        time_module.sleep(30)  # Check every 30 seconds
 
 # ============================================================
 # API
 # ============================================================
 
 @app.get("/api/health")
-async def health(): return {"status":"ok","version":"15.1","engine":"SMC Confluence Production"}
+async def health():
+    return {"status":"ok","version":"16.0","engine":"SMC Confluence 24/7","scanner":"auto"}
 
 @app.post("/api/smc-backtest")
 async def smc_backtest(req: SMCBacktestRequest):
@@ -407,38 +496,12 @@ async def smc_backtest(req: SMCBacktestRequest):
         if df_s is None or len(df_s)<10: raise HTTPException(404,"No data")
         req.rules.london_only=False; req.rules.max_trades=False
     if df_e is None or len(df_e)<20: df_e = df_s.copy()
-    result = run_backtest(df_s, df_e, df_h, req.rules.dict(), req.capital)
-    return result
+    return run_backtest(df_s, df_e, df_h, req.rules.dict(), req.capital)
 
 @app.post("/api/smc-scan")
 async def smc_scan(req: SMCBacktestRequest):
-    end = utc_now(); start = end - timedelta(days=5)
-    df_s = fetch_data(req.pair,"15m",start.strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
-    if df_s is None or len(df_s)<30: return {"signal":False}
-    df_h = fetch_data(req.pair,"4h",(end-timedelta(days=30)).strftime("%Y-%m-%d"),end.strftime("%Y-%m-%d"))
-    for i in range(len(df_s)-1,max(29,len(df_s)-6),-1):
-        bias = get_htf_bias(df_h, df_s.iloc[i]["date"], fb=df_s.iloc[i])
-        setup = build_setup(df_s, i, req.rules.dict(), bias)
-        if not setup: continue
-        lots = calculate_position_size(req.capital, setup["entry"], setup["sl"])
-        emoji = "🟢 LONG" if setup["direction"]=="BUY" else "🔴 SHORT"
-        msg = f"""🤖 <b>SMC CONFLUENCE — {emoji}</b>
-<b>XAUUSD</b>
-━━━━━━━━━━━━━━━━━━━━━
-📍 <b>Entry:</b> ${setup['entry']}
-🛑 <b>SL:</b> ${setup['sl']} ({setup['risk_points']} pts)
-🎯 <b>TP:</b> ${setup['tp']}
-📊 <b>R:R 1:{setup['rr_ratio']}</b>
-📐 <b>Lots:</b> {lots}
-💰 <b>Risk:</b> ${round(lots*setup['risk_points']*POINT_VALUE,2)} (1%)
-<b>{' | '.join(setup['met_rules'])}</b>
-━━━━━━━━━━━━━━━━━━━━━
-⏰ {setup['setup_time']}
-🧠 v15.1 Prod"""
-        send_tg(msg)
-        return {"signal":True,"direction":setup["direction"],"entry":setup["entry"],
-                "sl":setup["sl"],"tp":setup["tp"],"lots":lots,"time":str(setup["setup_time"])}
-    return {"signal":False,"last_check":str(end)}
+    result = run_scanner()
+    return {"signal":result,"last_check":str(utc_now())}
 
 # ============================================================
 # STARTUP
@@ -447,5 +510,16 @@ async def smc_scan(req: SMCBacktestRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    print(f"🚀 SMC Engine v15.1 starting on port {port}...")
+    
+    # Start 24/7 auto-scanner (background thread)
+    scanner_thread = threading.Thread(target=auto_scanner_loop, daemon=True)
+    scanner_thread.start()
+    print("🔍 24/7 Auto-Scanner: ACTIVE")
+    
+    # Start daily alive ping (background thread)
+    ping_thread = threading.Thread(target=daily_alive_ping, daemon=True)
+    ping_thread.start()
+    print("💓 Daily Alive Ping: ACTIVE (9:00 AM IST)")
+    
+    print(f"🚀 SMC Engine v16.0 starting on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
